@@ -160,7 +160,11 @@ func (g Adapter) SaveChannels(channels []*Channel) error {
 			_ = g.store.Channel().Edit(ctx, existing, func(c *Channel) error {
 				c.Name = channel.Name
 				c.IsOnline = channel.IsOnline
+
+				// TODO: 这里需要优化，更新的时候不应该覆盖上次的存储配置
+				recordMode := channel.Ext.GetRecordMode()
 				c.Ext = channel.Ext
+				c.Ext.RecordMode = recordMode
 				return nil
 			}, orm.Where("id=?", existing.ID))
 		} else {
