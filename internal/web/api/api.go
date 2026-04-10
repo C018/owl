@@ -18,6 +18,7 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
+	"github.com/gowvp/owl/internal/core/metadata/metadataapi"
 	"github.com/gowvp/owl/internal/core/sms"
 	"github.com/gowvp/owl/pkg/ota"
 	"github.com/gowvp/owl/plugin/stat"
@@ -122,6 +123,7 @@ func setupRouter(r *gin.Engine, uc *Usecase) {
 	uc.AIWebhookAPI.StartAISyncLoop(context.Background(), uc.SMSAPI.smsCore)
 	RegisterEvent(r, uc.EventAPI, auth)
 	RegisterRecording(r, uc.RecordingAPI, auth)
+	metadataapi.RegisterMetadata(r, uc.MetadataAPI, auth)
 }
 
 type playOutput struct {

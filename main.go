@@ -10,6 +10,7 @@ import (
 
 	"github.com/gowvp/owl/internal/app"
 	"github.com/gowvp/owl/internal/conf"
+	"github.com/ixugo/goddd/domain/version/versionapi"
 	"github.com/ixugo/goddd/pkg/system"
 )
 
@@ -56,6 +57,10 @@ func main() {
 			return time.Now().Format(time.DateTime)
 		}))
 	}
+
+	// 如果需要执行表迁移，递增此版本号和表更新说明
+	versionapi.DBVersion = "0.0.25"
+	versionapi.DBRemark = "onvif device support"
 
 	app.Run(&bc)
 }

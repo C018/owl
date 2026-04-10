@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/gowvp/owl/internal/conf"
-	"github.com/ixugo/goddd/domain/version/versionapi"
 	"github.com/ixugo/goddd/pkg/logger"
 	"github.com/ixugo/goddd/pkg/server"
 	"github.com/ixugo/goddd/pkg/system"
@@ -50,10 +49,6 @@ func Run(bc *conf.Bootstrap) {
 	if !bc.Server.AI.Disabled {
 		go setupAIClient(ctx, "http://127.0.0.1:15123/ai", bc.Debug)
 	}
-
-	// 如果需要执行表迁移，递增此版本号和表更新说明
-	versionapi.DBVersion = "0.0.23"
-	versionapi.DBRemark = "onvif device support"
 
 	handler, cleanUp, err := wireApp(bc, log)
 	if err != nil {
