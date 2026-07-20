@@ -170,6 +170,7 @@ func (d *ZLMDriver) Setup(ctx context.Context, ms *MediaServer, webhookURL strin
 		RtspLowLatency:           new("1"),
 		GeneralUnreadyFrameCache: new("50"),
 		GeneralMergeWriteMS:      new("100"),
+		GeneralListenIP:          new("0.0.0.0"),
 
 		// 录像配置
 		// 移除默认的 "record" 目录层级，简化路径结构
@@ -294,4 +295,10 @@ func (d *ZLMDriver) StartRecord(ctx context.Context, ms *MediaServer, req *zlm.S
 func (d *ZLMDriver) StopRecord(ctx context.Context, ms *MediaServer, req *zlm.StopRecordRequest) (*zlm.StopRecordResponse, error) {
 	engine := d.withConfig(ms)
 	return engine.StopRecord(*req)
+}
+
+// GetMediaList 批量获取所有在线流列表（含录制状态）
+func (d *ZLMDriver) GetMediaList(ctx context.Context, ms *MediaServer) (*zlm.GetMediaListResponse, error) {
+	engine := d.withConfig(ms)
+	return engine.GetMediaList()
 }

@@ -63,6 +63,59 @@ func NewIPCAPI(bundle IPCBundle, recordingCore recording.Core) IPCAPI {
 	return IPCAPI{ipc: bundle.Core, recordingCore: recordingCore}
 }
 
+// deviceIDInput 设备 ID 路径参数
+type deviceIDInput struct {
+	ID string `uri:"id" binding:"required"`
+}
+
+// channelIDInput 通道 ID 路径参数
+type channelIDInput struct {
+	ID string `uri:"id" binding:"required"`
+}
+
+// deleteZoneInput 删除区域的路径参数（通道 ID + 区域名）
+type deleteZoneInput struct {
+	ID   string `uri:"id" binding:"required"`
+	Name string `uri:"name" binding:"required"`
+}
+
+// updateDeviceInput 更新设备的请求参数（路径 ID + 请求体）
+type updateDeviceInput struct {
+	ID string `uri:"id" binding:"required"`
+	ipc.EditDeviceInput
+}
+
+// updateChannelInput 更新通道的请求参数（路径 ID + 请求体）
+type updateChannelInput struct {
+	ID string `uri:"id" binding:"required"`
+	ipc.EditChannelInput
+}
+
+// refreshSnapshotWithIDInput 刷新快照的请求参数（路径 ID + 请求体）
+type refreshSnapshotWithIDInput struct {
+	ID string `uri:"id" binding:"required"`
+	refreshSnapshotInput
+}
+
+// addZoneWithIDInput 添加区域的请求参数（路径 ID + 请求体）
+type addZoneWithIDInput struct {
+	ID string `uri:"id" binding:"required"`
+	ipc.AddZoneInput
+}
+
+// setRecordModeWithIDInput 设置录像模式的请求参数（路径 ID + 请求体）
+// Mode 不能带 binding tag，否则 ShouldBindUri 阶段就会校验失败（URI 中无 mode 字段）
+type setRecordModeWithIDInput struct {
+	ID   string `uri:"id" binding:"required"`
+	Mode string `json:"mode" binding:"omitempty,oneof=always ai none"`
+}
+
+// ptzControlWithIDInput 云台控制的请求参数（路径 ID + 请求体）
+type ptzControlWithIDInput struct {
+	ID string `uri:"id" binding:"required"`
+	ptzControlInput
+}
+
 func registerGB28181(g gin.IRouter, api IPCAPI, handler ...gin.HandlerFunc) {
 	// GB28181 协议特有的回调接口
 	g.Any("/gb28181/snapshot", func(c *gin.Context) {
@@ -79,12 +132,12 @@ func registerGB28181(g gin.IRouter, api IPCAPI, handler ...gin.HandlerFunc) {
 	// 统一的设备管理 API（支持所有协议）
 	{
 		group := g.Group("/devices", handler...)
-		group.GET("", web.WrapH(api.findDevice))                     // 设备列表（所有协议）
+		group.GET("", web.WrapH(api.listDevices))                    // 设备列表（所有协议）
 		group.GET("/:id", web.WrapH(api.getDevice))                  // 设备详情（所有协议）
-		group.PUT("/:id", web.WrapH(api.editDevice))                 // 修改设备（所有协议）
-		group.POST("", web.WrapH(api.addDevice))                     // 添加设备（所有协议，通过 type 区分）
-		group.DELETE("/:id", web.WrapH(api.delDevice))               // 删除设备（所有协议）
-		group.GET("/channels", web.WrapH(api.FindChannelsForDevice)) // 设备与通道列表（所有协议）
+		group.PUT("/:id", web.WrapH(api.updateDevice))               // 修改设备（所有协议）
+		group.POST("", web.WrapH(api.createDevice))                  // 添加设备（所有协议，通过 type 区分）
+		group.DELETE("/:id", web.WrapH(api.deleteDevice))            // 删除设备（所有协议）
+		group.GET("/channels", web.WrapH(api.ListChannelsForDevice)) // 设备与通道列表（所有协议）
 		group.POST("/:id/catalog", web.WrapH(api.queryCatalog))
 	}
 	{
@@ -96,15 +149,16 @@ func registerGB28181(g gin.IRouter, api IPCAPI, handler ...gin.HandlerFunc) {
 	// 统一的通道管理 API（支持所有协议）
 	{
 		group := g.Group("/channels", handler...)
-		group.GET("", web.WrapH(api.findChannel))                    // 通道列表（所有协议）
-		group.POST("", web.WrapH(api.addChannel))                    // 添加通道（RTMP/RTSP）
-		group.PUT("/:id", web.WrapH(api.editChannel))                // 修改通道（所有协议）
-		group.DELETE("/:id", web.WrapH(api.delChannel))              // 删除通道（RTMP/RTSP）
+		group.GET("", web.WrapH(api.listChannels))                   // 通道列表（所有协议）
+		group.POST("", web.WrapH(api.createChannel))                 // 添加通道（RTMP/RTSP）
+		group.PUT("/:id", web.WrapH(api.updateChannel))              // 修改通道（所有协议）
+		group.DELETE("/:id", web.WrapH(api.deleteChannel))           // 删除通道（RTMP/RTSP）
 		group.POST("/:id/play", web.WrapH(api.play))                 // 播放（所有协议）
 		group.POST("/:id/snapshot", web.WrapH(api.refreshSnapshot))  // 图像抓拍（所有协议）
 		group.GET("/:id/snapshot", api.getSnapshot)                  // 获取图像（所有协议）
 		group.POST("/:id/zones", web.WrapH(api.addZone))             // 添加区域（所有协议）
 		group.GET("/:id/zones", web.WrapH(api.getZones))             // 获取区域（所有协议）
+		group.DELETE("/:id/zones/:name", web.WrapH(api.deleteZone))  // 删除区域（所有协议）
 		group.POST("/:id/ai/enable", web.WrapH(api.enableAI))        // 启用 AI 检测
 		group.POST("/:id/ai/disable", web.WrapH(api.disableAI))      // 禁用 AI 检测
 		group.POST("/:id/record_mode", web.WrapH(api.setRecordMode)) // 设置录像模式
@@ -115,22 +169,20 @@ func registerGB28181(g gin.IRouter, api IPCAPI, handler ...gin.HandlerFunc) {
 
 // >>> device >>>>>>>>>>>>>>>>>>>>
 
-func (a IPCAPI) findDevice(c *gin.Context, in *ipc.FindDeviceInput) (any, error) {
-	items, total, err := a.ipc.FindDevice(c.Request.Context(), in)
+func (a IPCAPI) listDevices(c *gin.Context, in *ipc.FindDeviceInput) (any, error) {
+	items, total, err := a.ipc.ListDevices(c.Request.Context(), in)
 	return gin.H{"items": items, "total": total}, err
 }
 
-func (a IPCAPI) getDevice(c *gin.Context, _ *struct{}) (any, error) {
-	deviceID := c.Param("id")
-	return a.ipc.GetDevice(c.Request.Context(), deviceID)
+func (a IPCAPI) getDevice(c *gin.Context, in *deviceIDInput) (any, error) {
+	return a.ipc.GetDevice(c.Request.Context(), in.ID)
 }
 
-func (a IPCAPI) editDevice(c *gin.Context, in *ipc.EditDeviceInput) (any, error) {
-	deviceID := c.Param("id")
-	return a.ipc.EditDevice(c.Request.Context(), in, deviceID)
+func (a IPCAPI) updateDevice(c *gin.Context, in *updateDeviceInput) (any, error) {
+	return a.ipc.UpdateDevice(c.Request.Context(), &in.EditDeviceInput, in.ID)
 }
 
-// addDevice 添加设备（支持所有协议类型）
+// createDevice 添加设备（支持所有协议类型）
 // 通过 type 字段区分协议: "GB28181" 或 "ONVIF"
 //
 // 示例1 - 添加 GB28181 设备:
@@ -142,32 +194,29 @@ func (a IPCAPI) editDevice(c *gin.Context, in *ipc.EditDeviceInput) (any, error)
 //
 //	POST /devices
 //	{ "type": "ONVIF", "ip": "192.168.1.100", "port": 80, "username": "admin", "password": "12345" }
-func (a IPCAPI) addDevice(c *gin.Context, in *ipc.AddDeviceInput) (any, error) {
+func (a IPCAPI) createDevice(c *gin.Context, in *ipc.AddDeviceInput) (any, error) {
 	in.Type = strings.ToUpper(in.Type)
 	if !slices.Contains([]string{ipc.TypeGB28181, ipc.TypeOnvif}, in.Type) {
 		return nil, reason.ErrBadRequest.SetMsg("不支持的设备类型")
 	}
-	return a.ipc.AddDevice(c.Request.Context(), in)
+	return a.ipc.CreateDevice(c.Request.Context(), in)
 }
 
-func (a IPCAPI) delDevice(c *gin.Context, _ *struct{}) (any, error) {
-	did := c.Param("id")
-	return a.ipc.DelDevice(c.Request.Context(), did)
+func (a IPCAPI) deleteDevice(c *gin.Context, in *deviceIDInput) (any, error) {
+	return a.ipc.DeleteDevice(c.Request.Context(), in.ID)
 }
 
-func (a IPCAPI) queryCatalog(c *gin.Context, _ *struct{}) (any, error) {
-	did := c.Param("id")
-
-	if err := a.ipc.QueryCatalog(c.Request.Context(), did); err != nil {
+func (a IPCAPI) queryCatalog(c *gin.Context, in *deviceIDInput) (any, error) {
+	if err := a.ipc.QueryCatalog(c.Request.Context(), in.ID); err != nil {
 		return nil, err
 	}
 
 	return gin.H{"msg": "ok"}, nil
 }
 
-func (a IPCAPI) FindChannelsForDevice(c *gin.Context, in *ipc.FindDeviceInput) (any, error) {
+func (a IPCAPI) ListChannelsForDevice(c *gin.Context, in *ipc.FindDeviceInput) (any, error) {
 	ctx := c.Request.Context()
-	items, total, err := a.ipc.FindChannelsForDevice(ctx, in)
+	items, total, err := a.ipc.ListChannelsForDevice(ctx, in)
 
 	// 收集所有通道 ID 用于批量查询录像
 	var cids []string
@@ -204,8 +253,8 @@ func (a IPCAPI) FindChannelsForDevice(c *gin.Context, in *ipc.FindDeviceInput) (
 
 // >>> channel >>>>>>>>>>>>>>>>>>>>
 
-func (a IPCAPI) findChannel(c *gin.Context, in *ipc.FindChannelInput) (any, error) {
-	items, total, err := a.ipc.FindChannel(c.Request.Context(), in)
+func (a IPCAPI) listChannels(c *gin.Context, in *ipc.FindChannelInput) (any, error) {
+	items, total, err := a.ipc.ListChannels(c.Request.Context(), in)
 	if err != nil {
 		return nil, err
 	}
@@ -252,34 +301,67 @@ func (a IPCAPI) fillRTMPPushAddr(c *gin.Context, items []*ipc.Channel) {
 // 	return a.gb28181Core.GetChannel(c.Request.Context(), channelID)
 // }
 
-func (a IPCAPI) editChannel(c *gin.Context, in *ipc.EditChannelInput) (any, error) {
-	cid := c.Param("id")
-	return a.ipc.EditChannel(c.Request.Context(), in, cid)
+func (a IPCAPI) updateChannel(c *gin.Context, in *updateChannelInput) (any, error) {
+	ctx := c.Request.Context()
+
+	old, err := a.ipc.GetChannel(ctx, in.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	out, err := a.ipc.UpdateChannel(ctx, &in.EditChannelInput, in.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	// 流地址变更时，主动通知 ZLM 关闭旧的拉流
+	if old.Config.SourceURL != "" && old.Config.SourceURL != out.Config.SourceURL {
+		go a.closeOldStream(old)
+	}
+
+	return out, nil
 }
 
-// addChannel 添加 RTMP/RTSP 通道
-func (a IPCAPI) addChannel(c *gin.Context, in *ipc.AddChannelInput) (any, error) {
+// closeOldStream 流地址变更后关闭旧的 ZLM 拉流
+func (a IPCAPI) closeOldStream(ch *ipc.Channel) {
+	svr, err := a.uc.SMSAPI.smsCore.GetMediaServer(context.Background(), sms.DefaultMediaServerID)
+	if err != nil {
+		slog.Warn("updateChannel: 获取流媒体服务器失败", "err", err)
+		return
+	}
+	resp, err := a.uc.SMSAPI.smsCore.CloseStreams(svr, zlm.CloseStreamsRequest{
+		App:    ch.GetApp(),
+		Stream: ch.GetStream(),
+		Force:  true,
+	})
+	if err != nil {
+		slog.Error("updateChannel: 关闭旧流失败", "app", ch.GetApp(), "stream", ch.GetStream(), "err", err)
+		return
+	}
+	slog.Info("updateChannel: 旧流已关闭", "app", ch.GetApp(), "stream", ch.GetStream(), "closed", resp.CountClosed)
+}
+
+// createChannel 添加 RTMP/RTSP 通道
+func (a IPCAPI) createChannel(c *gin.Context, in *ipc.AddChannelInput) (any, error) {
 	in.Type = strings.ToUpper(in.Type)
 	if !slices.Contains([]string{ipc.TypeRTMP, ipc.TypeRTSP}, in.Type) {
 		return nil, reason.ErrBadRequest.SetMsg("仅支持 RTMP/RTSP 类型通道")
 	}
-	return a.ipc.AddChannel(c.Request.Context(), in)
+	return a.ipc.CreateChannel(c.Request.Context(), in)
 }
 
-// delChannel 删除 RTMP/RTSP 通道
-func (a IPCAPI) delChannel(c *gin.Context, _ *struct{}) (any, error) {
-	channelID := c.Param("id")
-
+// deleteChannel 删除 RTMP/RTSP 通道
+func (a IPCAPI) deleteChannel(c *gin.Context, in *channelIDInput) (any, error) {
 	// 仅允许删除 RTMP/RTSP 类型通道
-	if !bz.IsRTMP(channelID) && !bz.IsRTSP(channelID) {
+	if !bz.IsRTMP(in.ID) && !bz.IsRTSP(in.ID) {
 		return nil, reason.ErrBadRequest.SetMsg("仅支持删除 RTMP/RTSP 类型通道")
 	}
 
-	return a.ipc.DelChannel(c.Request.Context(), channelID)
+	return a.ipc.DeleteChannel(c.Request.Context(), in.ID)
 }
 
-func (a IPCAPI) play(c *gin.Context, _ *struct{}) (*playOutput, error) {
-	channelID := c.Param("id")
+func (a IPCAPI) play(c *gin.Context, in *channelIDInput) (*playOutput, error) {
+	channelID := in.ID
 
 	var app, appStream, host, stream, session, mediaServerID string
 
@@ -432,8 +514,8 @@ func (a IPCAPI) play(c *gin.Context, _ *struct{}) (*playOutput, error) {
 // 根据通道协议类型分发：
 //   - GB28181: SIP BYE + CloseRTPServer
 //   - ONVIF/RTSP/RTMP: ZLM close_streams
-func (a IPCAPI) stopPlay(c *gin.Context, _ *struct{}) (gin.H, error) {
-	channelID := c.Param("id")
+func (a IPCAPI) stopPlay(c *gin.Context, in *channelIDInput) (gin.H, error) {
+	channelID := in.ID
 	ctx := c.Request.Context()
 	log := slog.With("channel_id", channelID)
 
@@ -492,7 +574,7 @@ func (a IPCAPI) stopPlay(c *gin.Context, _ *struct{}) (gin.H, error) {
 		}
 
 		// 更新播放状态
-		if _, err := a.ipc.EditChannelPlaying(ctx, ch.GetStream(), false); err != nil {
+		if _, err := a.ipc.UpdateChannelPlaying(ctx, ch.GetStream(), false); err != nil {
 			log.WarnContext(ctx, "停止播放：更新播放状态失败", "err", err)
 		}
 	}
@@ -508,8 +590,8 @@ type refreshSnapshotInput struct {
 	URL string `json:"url"`
 }
 
-func (a IPCAPI) refreshSnapshot(c *gin.Context, in *refreshSnapshotInput) (any, error) {
-	channelID := c.Param("id")
+func (a IPCAPI) refreshSnapshot(c *gin.Context, in *refreshSnapshotWithIDInput) (any, error) {
+	channelID := in.ID
 
 	path := readCoverPath(a.uc.Conf.ConfigDir, channelID)
 
@@ -538,7 +620,7 @@ func (a IPCAPI) refreshSnapshot(c *gin.Context, in *refreshSnapshotInput) (any, 
 			GetSnapRequest: zlm.GetSnapRequest{
 				URL:        in.URL,
 				TimeoutSec: 10,
-				ExpireSec:  28800,
+				ExpireSec:  int(in.WithinSeconds),
 			},
 			Stream: channelID,
 		})
@@ -557,18 +639,51 @@ func (a IPCAPI) refreshSnapshot(c *gin.Context, in *refreshSnapshotInput) (any, 
 	return gin.H{"link": fmt.Sprintf("%s/channels/%s/snapshot?token=%s", prefix, channelID, token)}, nil
 }
 
-func (a IPCAPI) addZone(c *gin.Context, in *ipc.AddZoneInput) (gin.H, error) {
-	channelID := c.Param("id")
+func (a IPCAPI) addZone(c *gin.Context, in *addZoneWithIDInput) (gin.H, error) {
+	ctx := c.Request.Context()
+	channelID := in.ID
 	if len(in.Labels) == 0 {
 		in.Labels = []string{"person", "car", "cat", "dog"}
 	}
-	zones, err := a.ipc.AddZone(c.Request.Context(), in, channelID)
-	return gin.H{"items": zones}, err
+	zones, err := a.ipc.AddZone(ctx, &in.AddZoneInput, channelID)
+	if err != nil {
+		return nil, err
+	}
+
+	// 区域写入后，若 AI 已开启则立即重启任务使新区域生效
+	if a.uc != nil {
+		ch, chErr := a.ipc.GetChannel(ctx, channelID)
+		if chErr == nil && ch.Ext.EnabledAI {
+			if reloadErr := a.uc.AIWebhookAPI.ReloadAITask(ctx, ch); reloadErr != nil {
+				slog.WarnContext(ctx, "reload AI task after zone update failed", "camera_id", channelID, "err", reloadErr)
+			}
+		}
+	}
+	return gin.H{"items": zones}, nil
 }
 
-func (a IPCAPI) getZones(c *gin.Context, _ *struct{}) (any, error) {
-	channelID := c.Param("id")
-	return a.ipc.GetZones(c.Request.Context(), channelID)
+func (a IPCAPI) getZones(c *gin.Context, in *channelIDInput) (any, error) {
+	return a.ipc.GetZones(c.Request.Context(), in.ID)
+}
+
+func (a IPCAPI) deleteZone(c *gin.Context, in *deleteZoneInput) (gin.H, error) {
+	ctx := c.Request.Context()
+
+	zones, err := a.ipc.DeleteZone(ctx, in.ID, in.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	// 删除区域后，若 AI 已开启则立即重启任务使变更生效
+	if a.uc != nil {
+		ch, chErr := a.ipc.GetChannel(ctx, in.ID)
+		if chErr == nil && ch.Ext.EnabledAI {
+			if reloadErr := a.uc.AIWebhookAPI.ReloadAITask(ctx, ch); reloadErr != nil {
+				slog.WarnContext(ctx, "reload AI task after zone delete failed", "camera_id", in.ID, "err", reloadErr)
+			}
+		}
+	}
+	return gin.H{"items": zones}, nil
 }
 
 func (a IPCAPI) getSnapshot(c *gin.Context) {
@@ -628,8 +743,8 @@ var (
 )
 
 // enableAI 启用指定通道的 AI 检测功能，需要先确保全局 AI 服务已启用且连接正常
-func (a IPCAPI) enableAI(c *gin.Context, _ *struct{}) (gin.H, error) {
-	channelID := c.Param("id")
+func (a IPCAPI) enableAI(c *gin.Context, in *channelIDInput) (gin.H, error) {
+	channelID := in.ID
 	ctx := c.Request.Context()
 
 	// 检查全局 AI 配置
@@ -669,8 +784,8 @@ func (a IPCAPI) enableAI(c *gin.Context, _ *struct{}) (gin.H, error) {
 }
 
 // disableAI 禁用指定通道的 AI 检测功能，会同时停止正在运行的检测任务
-func (a IPCAPI) disableAI(c *gin.Context, _ *struct{}) (gin.H, error) {
-	channelID := c.Param("id")
+func (a IPCAPI) disableAI(c *gin.Context, in *channelIDInput) (gin.H, error) {
+	channelID := in.ID
 	ctx := c.Request.Context()
 
 	// 检查全局 AI 配置
@@ -730,17 +845,17 @@ func (a IPCAPI) buildRTSPURL(ctx context.Context, channelID string) (string, err
 	return fmt.Sprintf("rtsp://%s:%d/%s/%s", "127.0.0.1", svr.Ports.RTSP, app, stream), nil
 }
 
-// setRecordModeInput 设置录像模式请求参数
-type setRecordModeInput struct {
-	// 录像模式：always-一直录制，ai-按AI触发录制，none-不录制
-	Mode string `json:"mode" binding:"required,oneof=always ai none"`
-}
-
 // setRecordMode 设置通道的录像模式，支持三种模式：always(一直录制)、ai(AI触发录制)、none(不录制)
 // always 和 ai 都会启用录制
-func (a IPCAPI) setRecordMode(c *gin.Context, in *setRecordModeInput) (gin.H, error) {
-	channelID := c.Param("id")
+func (a IPCAPI) setRecordMode(c *gin.Context, in *setRecordModeWithIDInput) (gin.H, error) {
+	channelID := in.ID
 	ctx := c.Request.Context()
+
+	switch in.Mode {
+	case "always", "ai", "none":
+	default:
+		return nil, reason.ErrBadRequest.SetMsg("mode must be one of: always, ai, none")
+	}
 
 	// 更新通道的录像模式
 	channel, err := a.ipc.SetRecordMode(ctx, channelID, in.Mode)
@@ -784,8 +899,8 @@ type ptzControlInput struct {
 }
 
 // ptzControl 云台控制接口
-func (a IPCAPI) ptzControl(c *gin.Context, in *ptzControlInput) (gin.H, error) {
-	channelID := c.Param("id")
+func (a IPCAPI) ptzControl(c *gin.Context, in *ptzControlWithIDInput) (gin.H, error) {
+	channelID := in.ID
 	ctx := c.Request.Context()
 
 	// 获取通道信息
@@ -809,7 +924,7 @@ func (a IPCAPI) ptzControl(c *gin.Context, in *ptzControlInput) (gin.H, error) {
 		"channel_id", channelID,
 		"channel_device_id", channel.DeviceID,
 		"channel_channel_id", channel.ChannelID,
-		"channel_ptztype", channel.PTZType, // 添加 PTZ 类型
+		"channel_ptztype", channel.PTZ, // 添加 PTZ 类型
 		"device_id", device.ID,
 		"device_type", device.GetType(),
 		"action", in.Action,

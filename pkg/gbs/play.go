@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,10 +32,14 @@ func (g *GB28181API) stopPlay(ch *Channel, in *StopPlayInput) error {
 	key := "play:" + in.Channel.DeviceID + ":" + in.Channel.ChannelID
 	stream, ok := g.streams.LoadAndDelete(key)
 	if !ok {
+		// 流已被其他调用者移除（重复 stop、logout 并发等），属于正常情况
+		slog.Debug("stopPlay: 流不存在，跳过", "device_id", in.Channel.DeviceID, "channel_id", in.Channel.ChannelID)
 		return nil
 	}
 
 	if stream.Resp == nil {
+		// INVITE 尚未收到 200 OK 响应就被 stop，说明 INVITE 超时或设备拒绝后流未正常建立
+		slog.Debug("stopPlay: Resp 为空，INVITE 可能未完成，跳过 BYE", "device_id", in.Channel.DeviceID, "channel_id", in.Channel.ChannelID)
 		return nil
 	}
 
@@ -58,7 +63,7 @@ func (g *GB28181API) StopPlay(ctx context.Context, in *StopPlayInput) error {
 	defer ch.device.playMutex.Unlock()
 
 	defer func() {
-		g.svr.gb.core.EditPlaying(ctx, in.Channel.DeviceID, in.Channel.ChannelID, false)
+		g.svr.gb.core.UpdatePlaying(ctx, in.Channel.DeviceID, in.Channel.ChannelID, false)
 	}()
 	return g.stopPlay(ch, in)
 }
@@ -81,23 +86,27 @@ func (g *GB28181API) Play(in *PlayInput) error {
 
 	// 播放中
 	key := "play:" + in.Channel.DeviceID + ":" + in.Channel.ChannelID
-	stream, ok := g.streams.LoadOrStore(key, &Streams{})
-	if ok {
-		log.Debug("PLAY 已存在流")
-		// TODO: 临时解决方案，每次播放，先停止再播放
-		// https://github.com/gowvp/owl/issues/16
+	if _, ok := g.streams.LoadOrStore(key, &Streams{}); ok {
+		log.Debug("PLAY 已存在流，先停止再播放")
 		if err := g.stopPlay(ch, &StopPlayInput{
 			Channel: in.Channel,
 		}); err != nil {
 			slog.Error("stop play failed", "err", err)
 		}
 	}
+	stream, _ := g.streams.LoadOrStore(key, &Streams{})
 
-	log.Debug("1. 开启RTP服务器等待接收视频流")
-	// 开启RTP服务器等待接收视频流
+	// 提前分配 SSRC，用于 ZLM 端口绑定防串流
+	ssrc := g.getSSRC(0)
+	ssrcVal, _ := strconv.ParseUint(ssrc, 10, 64)
+	stream.ssrc = ssrc
+
+	log.Debug("1. 开启RTP服务器等待接收视频流", "ssrc", ssrc)
+	// 开启RTP服务器等待接收视频流，传入 ssrc 让 ZLM 校验，防止其他设备往该端口推流
 	resp, err := g.sms.OpenRTPServer(in.SMS, zlm.OpenRTPServerRequest{
 		TCPMode:  in.StreamMode,
 		StreamID: in.Channel.ID,
+		SSRC:     ssrcVal,
 	})
 	if err != nil {
 		log.Debug("1.1. 开启RTP服务器失败", "err", err)
@@ -119,6 +128,7 @@ func (g *GB28181API) Play(in *PlayInput) error {
 			resp, err = g.sms.OpenRTPServer(in.SMS, zlm.OpenRTPServerRequest{
 				TCPMode:  in.StreamMode,
 				StreamID: in.Channel.ID,
+				SSRC:     ssrcVal,
 			})
 			if err != nil {
 				log.Debug("1.2. 重新开启RTP服务器失败", "err", err)
@@ -133,10 +143,12 @@ func (g *GB28181API) Play(in *PlayInput) error {
 	log.Debug("2. 发送SDP请求", "port", resp.Port)
 	if err := g.sipPlayPush2(ch, in, resp.Port, stream); err != nil {
 		log.Debug("2.1. 发送SDP请求失败", "err", err)
+		// INVITE 失败（含 400 Bad Request），确保播放状态被清除
+		g.svr.gb.core.UpdatePlaying(context.TODO(), in.Channel.DeviceID, in.Channel.ChannelID, false)
 		return err
 	}
 
-	g.svr.gb.core.EditPlaying(context.TODO(), in.Channel.DeviceID, in.Channel.ChannelID, true)
+	g.svr.gb.core.UpdatePlaying(context.TODO(), in.Channel.DeviceID, in.Channel.ChannelID, true)
 
 	return nil
 }
@@ -191,7 +203,9 @@ func GetIP(input string) (string, error) {
 
 // buildPlaySDP 构造实时播放的 SDP 报文体。
 // streamMode: 0=UDP, 1=TCP被动, 2=TCP主动
-func buildPlaySDP(channelID, ip string, port int, streamMode int8, ssrc string) []byte {
+// 为什么 deviceID 和 channelID 分开传: Origin Username 应填设备 ID（GB28181 规范），
+// 而 Subject 等其他字段需要通道 ID，两者不可混用。
+func buildPlaySDP(deviceID, channelID, ip string, port int, streamMode int8, ssrc string) []byte {
 	protocol := "TCP/RTP/AVP"
 	if streamMode == 0 {
 		protocol = "RTP/AVP"
@@ -201,7 +215,7 @@ func buildPlaySDP(channelID, ip string, port int, streamMode int8, ssrc string) 
 		Description: sdp.MediaDescription{
 			Type:     "video",
 			Port:     port,
-			Formats:  []string{"96", "97", "98"},
+			Formats:  []string{"96", "97", "98", "99"},
 			Protocol: protocol,
 		},
 	}
@@ -218,11 +232,12 @@ func buildPlaySDP(channelID, ip string, port int, streamMode int8, ssrc string) 
 	video.AddAttribute("rtpmap", "96", "PS/90000")
 	video.AddAttribute("rtpmap", "97", "MPEG4/90000")
 	video.AddAttribute("rtpmap", "98", "H264/90000")
+	video.AddAttribute("rtpmap", "99", "H265/90000")
 
 	msg := &sdp.Message{
 		Version: 0,
 		Origin: sdp.Origin{
-			Username:    channelID,
+			Username:    deviceID,
 			NetworkType: "IN",
 			AddressType: "IP4",
 			Address:     ip,
@@ -239,7 +254,9 @@ func buildPlaySDP(channelID, ip string, port int, streamMode int8, ssrc string) 
 		SSRC:   ssrc,
 	}
 
-	return msg.Append(nil).AppendTo(nil)
+	body := msg.Append(nil).AppendTo(nil)
+	body = append(body, "f=\r\n"...)
+	return body
 }
 
 // sipPlayPush2 向摄像机发送 INVITE 请求拉取实时流。
@@ -252,8 +269,7 @@ func buildPlaySDP(channelID, ip string, port int, streamMode int8, ssrc string) 
 // GB28181 关键约束：
 //  1. SDP `y=`（SSRC）必须与 SIP Subject 头中的发送方 SSRC 一致，
 //     否则设备无法将信令与 RTP 流绑定，导致不推流。
-//  2. SDP 须有 `v=0` 与 `u=` 字段，老设备会校验。
-//  3. Subject 格式：`<channel_id>:<sender_ssrc>,<sip_server_id>:0`。
+//  2. Subject 格式：`<channel_id>:<sender_ssrc>,<sip_server_id>:0`。
 func (g *GB28181API) sipPlayPush2(ch *Channel, in *PlayInput, port int, stream *Streams) error {
 	ipstr := in.SMS.GetSDPIP()
 	ip4str, err := GetIP(ipstr)
@@ -263,10 +279,10 @@ func (g *GB28181API) sipPlayPush2(ch *Channel, in *PlayInput, port int, stream *
 	}
 	slog.Info("域名解析成功", "原始域名", ipstr, "解析IP", ip4str)
 
-	ssrc := g.getSSRC(0)
-	stream.ssrc = ssrc
+	// SSRC 已在 Play 中提前分配并绑定到 ZLM 端口，此处直接使用
+	ssrc := stream.ssrc
 
-	body := buildPlaySDP(ch.ChannelID, ip4str, port, in.StreamMode, ssrc)
+	body := buildPlaySDP(in.Channel.DeviceID, ch.ChannelID, ip4str, port, in.StreamMode, ssrc)
 	slog.Debug("INVITE SDP", "ssrc", ssrc, "channelID", ch.ChannelID, "body", string(body))
 
 	dev := ch.device
@@ -289,13 +305,17 @@ func (g *GB28181API) sipPlayPush2(ch *Channel, in *PlayInput, port int, stream *
 		viaHost = g.svr.fromAddress.URI.FHost
 	}
 
-	// To: 使用服务端 SIP 域名（与参考代码和成功抓包一致）
-	toURI, _ := sip.ParseURI(fmt.Sprintf("sip:%s@%s", ch.ChannelID, g.cfg.GetDomain()))
+	deviceHost := g.cfg.GetDomain()
+	if source != nil {
+		deviceHost = source.String()
+	}
+	toURI, _ := sip.ParseURI(fmt.Sprintf("sip:%s@%s", ch.ChannelID, deviceHost))
 	toAddr := &sip.Address{URI: toURI, Params: sip.NewParams()}
 
-	// Contact: 纯地址不带 DisplayName，与参考代码一致
+	// Contact: 纯地址不带 DisplayName
 	contact := &sip.Address{URI: g.svr.fromAddress.URI, Params: sip.NewParams()}
 
+	fromURI, _ := sip.ParseURI(fmt.Sprintf("sip:%s@%s", g.cfg.ID, g.cfg.GetDomain()))
 	hb := sip.NewHeaderBuilder().
 		SetMethod(sip.MethodInvite).
 		SetTo(toAddr).
@@ -307,7 +327,7 @@ func (g *GB28181API) sipPlayPush2(ch *Channel, in *PlayInput, port int, stream *
 			Host:            viaHost,
 			Params:          sip.NewParams().Add("branch", sip.String{Str: sip.GenerateBranch()}),
 		}).
-		SetFrom(&sip.Address{URI: g.svr.fromAddress.URI, Params: sip.NewParams().Add("tag", sip.String{Str: sip.RandString(5)})}).
+		SetFrom(&sip.Address{URI: fromURI, Params: sip.NewParams().Add("tag", sip.String{Str: sip.RandString(5)})}).
 		SetContentType(&sip.ContentTypeSDP).
 		SetSubject(fmt.Sprintf("%s:%s,%s:%s", ch.ChannelID, ssrc, g.cfg.ID, "0"))
 

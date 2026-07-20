@@ -77,7 +77,7 @@ func NewGB28181API(cfg *conf.Bootstrap, store ipc.Adapter, sms *sms.NodeManager)
 		for i, ch := range channel {
 			// 使用 PTZType 字段判断是否有云台能力
 			// PTZType > 0 表示有云台，0 表示无云台或未知
-			ptzType := ch.PTZType
+			ptz := ch.PTZType
 
 			// 调试日志：打印解析到的云台能力值
 			slog.Info("Catalog PTZ 解析",
@@ -86,14 +86,14 @@ func NewGB28181API(cfg *conf.Bootstrap, store ipc.Adapter, sms *sms.NodeManager)
 				"name", ch.Name,
 				"ptz_type", ch.PTZType,
 				"camera_type", ch.CameraType,
-				"result", ptzType)
+				"result", ptz)
 
 			out[i] = &ipc.Channel{
 				DeviceID:  s,
 				ChannelID: ch.ChannelID,
 				Name:      ch.Name,
 				IsOnline:  ch.Status == "OK" || ch.Status == "ON",
-				PTZType:   ptzType,
+				PTZ:       ptz,
 				Ext: ipc.DeviceExt{
 					Manufacturer: ch.Manufacturer,
 					Model:        ch.Model,
@@ -246,6 +246,25 @@ func (g GB28181API) login(ctx *sip.Context, fn func(d *ipc.Device) error) {
 
 func (g GB28181API) logout(deviceID string, changeFn func(*ipc.Device) error) error {
 	slog.Info("status change 设备离线", "device_id", deviceID)
+
+	// 设备离线前，遍历其所有通道，对有活跃流的通道发 BYE 释放 SIP 会话，
+	if dev, ok := g.svr.memoryStorer.Load(deviceID); ok {
+		dev.Channels.Range(func(channelID string, ch *Channel) bool {
+			key := "play:" + deviceID + ":" + channelID
+			if stream, loaded := g.streams.LoadAndDelete(key); loaded && stream.Resp != nil {
+				req := sip.NewRequestFromResponse(sip.MethodBYE, stream.Resp)
+				req.SetDestination(ch.Source())
+				req.SetConnection(ch.Conn())
+				if _, err := g.svr.Request(req); err != nil {
+					slog.Warn("logout: 发送 BYE 失败", "device_id", deviceID, "channel_id", channelID, "err", err)
+				} else {
+					slog.Info("logout: 已发送 BYE", "device_id", deviceID, "channel_id", channelID)
+				}
+			}
+			return true
+		})
+	}
+
 	return g.svr.memoryStorer.Change(deviceID, changeFn, func(d *Device) {
 		d.Expires = 0
 		d.IsOnline = false

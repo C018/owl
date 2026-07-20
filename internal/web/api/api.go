@@ -20,6 +20,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gowvp/owl/internal/core/metadata/metadataapi"
 	"github.com/gowvp/owl/internal/core/sms"
+	"github.com/gowvp/owl/internal/web/onvifserver"
 	"github.com/gowvp/owl/pkg/ota"
 	"github.com/gowvp/owl/plugin/stat"
 	"github.com/gowvp/owl/plugin/stat/statapi"
@@ -100,6 +101,7 @@ func setupRouter(r *gin.Engine, uc *Usecase) {
 	})
 
 	auth := AuthMiddleware(uc.Conf.Server.HTTP.JwtSecret, uc.Conf.Server.HTTP.AuthURL)
+	onvifserver.Register(r, uc.GB28181API.ipc, uc.SMSAPI.smsCore, uc.Conf)
 	r.Any("/health", web.WrapH(uc.getHealth))
 	r.GET("/app/metrics/api", web.WrapH(uc.getMetricsAPI))
 	r.GET("/app/version/check", web.WrapH(uc.checkVersion))
@@ -117,8 +119,8 @@ func setupRouter(r *gin.Engine, uc *Usecase) {
 	// 反向代理流媒体数据
 	r.Any("/proxy/sms/*path", uc.proxySMS)
 
-	// 注册 AI 分析服务回调接口
-	registerAIWebhookAPI(r, uc.AIWebhookAPI)
+	// 注册 AI 分析服务回调接口，/ai/events 是 /webhook/events 的别名
+	registerAIWebhookAPI(r, uc.AIWebhookAPI, uc.WebHookAPI)
 	// 启动 AI 任务同步协程，每 5 分钟检测一次数据库与内存状态差异
 	uc.AIWebhookAPI.StartAISyncLoop(context.Background(), uc.SMSAPI.smsCore)
 	RegisterEvent(r, uc.EventAPI, auth)
